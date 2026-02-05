@@ -1,0 +1,208 @@
+// --- CONFIGURATION ---
+const IMAGE_FOLDER_ID = "1OlfJpUhNL6KyLTv3xkN63BZGclRkOkTt"; 
+const GEMINI_API_KEY = "AIzaSyC-N2LWxiE9Tq780fUNnAVMDSmN6JfbwT0"; 
+
+function doGet(e) {
+  const template = HtmlService.createTemplateFromFile('index');
+  template.initialView = e.parameter.view || 'form';
+  return template.evaluate()
+    .setTitle('Field Observation System')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// --- API: Get Initial Config (Dynamic from Settings Tab) ---
+function getInitialData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const forSheet = ss.getSheetByName("Google FOR");
+  let settingsSheet = ss.getSheetByName("Settings");
+  
+  if (!forSheet) throw new Error("'Google FOR' sheet missing");
+
+  // 1. Get Next Report Number
+  const lastRow = forSheet.getLastRow();
+  let maxNum = 0;
+  if (lastRow > 1) {
+    const vals = forSheet.getRange(2, 3, lastRow - 1, 1).getValues(); // Column C for FOR-YYYY-XXX
+    vals.forEach(v => {
+      if(v[0] && typeof v[0] === 'string') {
+        const parts = v[0].split('-');
+        if (parts.length >= 3) {
+          const num = parseInt(parts[2], 10);
+          if(!isNaN(num) && num > maxNum) maxNum = num;
+        }
+      }
+    });
+  }
+
+  // 2. Get Dynamic Settings
+  const config = {
+    programs: [], 
+    projects: {}, 
+    companies: [], 
+    people: [] 
+  };
+
+  if (settingsSheet) {
+    const lastSettingRow = settingsSheet.getLastRow();
+    if (lastSettingRow > 1) {
+      const data = settingsSheet.getRange(2, 1, lastSettingRow - 1, 4).getValues();
+      data.forEach(row => {
+        const prog = row[0] ? String(row[0]).trim() : "";
+        const proj = row[1] ? String(row[1]).trim() : "";
+        const comp = row[2] ? String(row[2]).trim() : "";
+        const pers = row[3] ? String(row[3]).trim() : "";
+
+        if (prog && !config.programs.includes(prog)) config.programs.push(prog);
+        
+        if (proj) {
+            const parentProg = prog || "General";
+            if (!config.projects[parentProg]) config.projects[parentProg] = [];
+            if (!config.projects[parentProg].includes(proj)) config.projects[parentProg].push(proj);
+        }
+
+        if (comp && !config.companies.includes(comp)) config.companies.push(comp);
+        if (pers) config.people.push({ name: pers, company: comp || "Other" });
+      });
+    }
+  }
+
+  return { nextReportNumber: maxNum + 1, config: config };
+}
+
+// --- API: Add Admin Entry ---
+function addAdminEntry(type, val1, val2) {
+  let ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Settings");
+  if (!sheet) {
+      sheet = ss.insertSheet("Settings");
+      sheet.appendRow(["Program_List", "Project_List", "Company_List", "Person_List"]);
+  }
+
+  const lastRow = sheet.getLastRow() + 1;
+  if (type === 'Project') {
+      sheet.getRange(lastRow, 1).setValue(val1); // Program
+      sheet.getRange(lastRow, 2).setValue(val2); // Project
+  } else if (type === 'Person') {
+      sheet.getRange(lastRow, 3).setValue(val1); // Company
+      sheet.getRange(lastRow, 4).setValue(val2); // Person
+  }
+
+  return getInitialData();
+}
+
+// --- API: Get Historical Data ---
+function getHistoricalData() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Google FOR");
+  if (!sheet) return [];
+  const data = sheet.getDataRange().getValues();
+  const headers = data.shift();
+
+  return data.map((row, index) => {
+    const obj = {};
+    headers.forEach((header, i) => {
+      if (row[i] instanceof Date) {
+        obj[header] = row[i].toISOString().split('T')[0];
+      } else {
+        obj[header] = row[i];
+      }
+    });
+    // Fallback: If Program_Name is empty but Project_Type exists, use Project_Type
+    if (!obj.Program_Name && obj.Project_Type) obj.Program_Name = obj.Project_Type;
+    
+    obj._rowIndex = index + 2;
+    return obj;
+  });
+}
+
+// --- API: Update Observation (Includes Risk Closeout) ---
+function updateObservation(payload) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Google FOR");
+  if (!sheet) throw new Error("Sheet not found");
+
+  const idColumn = sheet.getRange("A:A").getValues().flat();
+  const rowIndex = idColumn.indexOf(payload.Observation_ID);
+  if (rowIndex === -1) throw new Error("Observation ID not found");
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const actualRow = rowIndex + 1;
+
+  const updateCell = (headerName, value) => {
+    const colIndex = headers.indexOf(headerName) + 1;
+    if (colIndex > 0 && value !== undefined) {
+      sheet.getRange(actualRow, colIndex).setValue(value);
+    }
+  };
+
+  updateCell("Status", payload.Status);
+  updateCell("PM_Comments", payload.PM_Comments);
+  updateCell("PM_Action_Type", payload.PM_Action_Type);
+  
+  // NEW: Risk Closeout Fields
+  if (payload.Risk_Closeout_Notes !== undefined) updateCell("Risk_Closeout_Notes", payload.Risk_Closeout_Notes);
+  if (payload.Risk_Closeout_Date !== undefined) updateCell("Risk_Closeout_Date", payload.Risk_Closeout_Date);
+
+  return { success: true };
+}
+
+// --- API: Save Data ---
+function saveObservationsBatch(observations) {
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Google FOR");
+    let folder;
+    if (IMAGE_FOLDER_ID) {
+      try { folder = DriveApp.getFolderById(IMAGE_FOLDER_ID); }
+      catch (e) { console.error("Invalid Folder ID: " + e.toString()); }
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    
+    observations.forEach(obs => {
+      let imageUrl = "";
+      let imageName = "";
+
+      if (obs.Image_DataUrl && folder) {
+        try {
+          const data = obs.Image_DataUrl.split(',')[1];
+          const decoded = Utilities.base64Decode(data);
+          const blob = Utilities.newBlob(decoded, obs.Image_Type, obs.Image_Name);
+          const file = folder.createFile(blob);
+          file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+          imageUrl = file.getUrl();
+          imageName = obs.Image_Name;
+        } catch (err) { console.error("Error saving image: " + err); }
+      }
+
+      const rowData = [];
+      headers.forEach(header => {
+        let val = "";
+        if (header === "Timestamp") val = new Date();
+        else if (header === "Image_URL") val = imageUrl;
+        else if (header === "Image_Name") val = imageName;
+        // MAP Project_Type (Frontend) -> Program_Name (Sheet)
+        else if (header === "Program_Name") val = obs.Project_Type; 
+        else if (obs[header] !== undefined) val = obs[header];
+        rowData.push(val);
+      });
+      sheet.appendRow(rowData);
+    });
+
+    return { success: true, count: observations.length };
+  } catch (e) { throw new Error(e.toString()); }
+}
+
+// --- API: AI Risk Analysis ---
+function analyzeRiskWithGemini(description) {
+  if (!GEMINI_API_KEY) return { severity: "Unknown", mitigationSteps: [] };
+  const model = "gemini-2.0-flash-001";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+  const payload = { contents: [{ parts: [{ text: `Analyze construction risk: "${description}". JSON: { "severity": "Low"|"Medium"|"High", "mitigationSteps": ["step1"] }` }] }] };
+  try {
+    const response = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true });
+    const json = JSON.parse(response.getContentText());
+    if (json.candidates && json.candidates[0]) {
+      const text = json.candidates[0].content.parts[0].text.replace(/```json/g, '').replace(/```/g, '').trim();
+      return JSON.parse(text);
+    }
+  } catch (e) { return { severity: "Error", mitigationSteps: [e.toString()] }; }
+}
