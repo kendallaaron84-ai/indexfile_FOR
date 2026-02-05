@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Field Observation System</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & DOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel for in-browser compilation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- PDF Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #888; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3b82f6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .animate-fade-in { animation: fadeIn 0.2s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans">
+    <div id="root"></div>
+
+    <!-- MAIN APPLICATION SCRIPT -->
+    <script type="text/babel" data-presets="react,typescript">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- 1. SERVICE LAYER (With Mock Fallback for Preview) ---
+        const GAS = {
+            run: (fname, ...args) => new Promise((resolve, reject) => {
+                if (typeof google !== 'undefined' && google.script && google.script.run) {
+                    // Production: Run on Google Apps Script
+                    google.script.run
+                        .withSuccessHandler(resolve)
+                        .withFailureHandler(reject)
+                        [fname](...args);
+                } else {
+                    // Development/Preview: Mock responses
+                    console.log(`[MOCK GAS] Calling ${fname} with`, args);
+                    setTimeout(() => {
+                        if (fname === 'getInitialData') {
+                            resolve({ nextReportNumber: 101 });
+                        } else if (fname === 'getHistoricalData') {
+                            resolve([
+                                { 
+                                    Observation_ID: 'FOR-2025-001', 
+                                    FOR_Report_No: 'FOR-2025-001', 
+                                    Project_Name: 'TDP: New Terminal - 15', 
+                                    Status: 'In Progress', 
+                                    PM_Action_Type: 'RFI',
+                                    Observation_Date: '2025-12-01', 
+                                    Description: 'High risk issue: Exposed rebar on level 2.', 
+                                    PM_Comments: 'Waiting on structural engineer.', 
+                                    Observation_Type: 'Risk', 
+                                    Submitted_By: 'Andrew Jaffee',
+                                    Image_URL: 'https://placehold.co/600x400/png?text=Exposed+Rebar', 
+                                    AI_Risk_Analysis: '{"severity": "High", "mitigationSteps": ["Immediate structural review required", "Cordon off area"]}'
+                                },
+                                { 
+                                    Observation_ID: 'FOR-2025-002', 
+                                    FOR_Report_No: 'FOR-2025-002', 
+                                    Project_Name: 'CIP: Gate 20', 
+                                    Status: 'Closed', 
+                                    PM_Action_Type: 'Closed',
+                                    Observation_Date: '2025-11-15', 
+                                    Description: 'Debris cleared from walkway.', 
+                                    PM_Comments: 'Resolved', 
+                                    Observation_Type: 'Safety', 
+                                    Submitted_By: 'Dewon Johnson',
+                                    AI_Risk_Analysis: '{"severity": "Low", "mitigationSteps": ["Standard cleanup"]}'
+                                }
+                            ]);
+                        } else if (fname === 'analyzeRiskWithGemini') {
+                            resolve({ severity: "Medium", mitigationSteps: ["Mock Step 1", "Mock Step 2"] });
+                        } else {
+                            resolve({ success: true });
+                        }
+                    }, 800);
+                }
+            })
+        };
+
+        const getInitialData = () => GAS.run('getInitialData');
+        const saveObservationsBatch = (payload) => GAS.run('saveObservationsBatch', payload);
+        const analyzeRiskWithGemini = (desc) => GAS.run('analyzeRiskWithGemini', desc);
+        const getHistoricalData = () => GAS.run('getHistoricalData');
+        const updateObservation = (payload) => GAS.run('updateObservation', payload);
+
+        // --- 2. CONSTANTS ---
+        const PROJECTS = {
+            'TDP': ['TDP: New Terminal - 15', 'Fueling Hydrant System - 05', 'TDP: TA Reconfig - 07', 'TDP: TB Reconfig - 08', 'TDP: Enhanced Parking Solution - 13'],
+            'CIP': ['Gate 20 Relocation', 'Terminal A (GLF) Ground Loading Facility', 'Terminal C Parking Garage/ GTC']
+        };
+        const STAGES = ["Construction", "Commissioning", "Trials", "Handover"];
+        const LOCATIONS = ['Ticket Hall East', 'Ticket Hall West', 'Ticket Hall Interior', 'Ticket Hall South', 'Sterile Corridor', 'Baggage', 'Great Hall', 'Connector', 'CUP', 'Apron', 'Access Roadway', 'Elevator', 'Hold room'];
+        const BUILDING_LEVELS = ['Level 1', 'Level 2', 'Level 3', 'Roof'];
+        const WEATHER = ["Dry", "Wet"];
+        
+        const ATTENDEES_GROUPS = {
+            'Alterman': ['Pablo Aragon'],
+            'Atkins': ['Anibal Rios', 'Cameron Spencer', 'Tiffany Schlotmann'],
+            'Aviation': ['Jorge Villarreal', 'Roland Ibarra'],
+            'HP': ['Bryan Davis', 'Josh Warren', 'Nick Bessire'],
+            'ITSD': ['Andrew Jaffee', 'Dewon Johnson', 'John Perez', 'Kassaundra Salinas', 'Kendall Aaron', 'Lejandro Ligeralde', 'Ricardo Briseno', 'Ytevia Watts'],
+            'Jacobs': ['Bill Vardoulis', 'Elizabeth Mayo', 'Tracey Wright']
+        };
+
+        const ALL_ATTENDEES = [
+            'Andrew Jaffee', 'Dewon Johnson', 'John Perez', 'Kassaundra Salinas', 
+            'Kendall Aaron', 'Lejandro Ligeralde', 'Ricardo Briseno', 'Ytevia Watts'
+        ].sort();
+
+        const PmStatus = {
+            IN_PROGRESS: 'In Progress',
+            ACCEPTED: 'Accepted',
+            REJECTED: 'Rejected',
+            CLOSED: 'Closed'
+        };
+
+        const PmTypes = {
+            RFI: 'RFI',
+            COORD: 'Contractor Coordination',
+            SUBMITTAL: 'Submittal',
+            CHANGE_REQ: 'Change Request',
+            GEN_OBS: 'General Observation',
+            CLOSED: 'Closed'
+        };
+
+        // --- 3. HELPER FUNCTIONS ---
+        // Converts standard Drive view link to direct image source link
+        const getDirectImgUrl = (url) => {
+            if (!url) return undefined;
+            try {
+                if (!url.includes('drive.google.com')) return url;
+                
+                let id = null;
+                // Try to extract ID from standard /d/ID format
+                const parts = url.split('/d/');
+                if (parts.length > 1) {
+                    id = parts[1].split('/')[0];
+                } 
+                // Try to extract ID from id=ID format
+                else if (url.includes('id=')) {
+                    const idPart = url.split('id=')[1];
+                    if (idPart) id = idPart.split('&')[0];
+                }
+
+                if (id) {
+                    // Use the thumbnail endpoint which is more reliable for embedding
+                    // sz=s4000 requests the image up to 4000px in size (basically full res)
+                    return `https://drive.google.com/thumbnail?id=${id}&sz=s4000`;
+                }
+                return url;
+            } catch (e) {
+                console.error("Error parsing image URL:", e);
+                return url;
+            }
+        };
+
+        // --- 4. HELPER COMPONENTS ---
+        const ReviewModal = ({ obs, onClose, onSave }) => {
+            const [status, setStatus] = useState(obs.Status || 'In Progress');
+            const [pmType, setPmType] = useState(obs.PM_Action_Type || '');
+            const [comment, setComment] = useState(obs.PM_Comments || '');
+            
+            const handleSave = () => {
+                onSave({
+                    Observation_ID: obs.Observation_ID,
+                    Status: status,
+                    PM_Action_Type: pmType,
+                    PM_Comments: comment
+                });
+            };
+
+            const displayImageUrl = useMemo(() => getDirectImgUrl(obs.Image_URL), [obs.Image_URL]);
+            
+            // Parse Risk Analysis JSON
+            const riskData = useMemo(() => {
+                if (!obs.AI_Risk_Analysis) return null;
+                try {
+                    return JSON.parse(obs.AI_Risk_Analysis);
+                } catch (e) {
+                    return { severity: "Unknown", mitigationSteps: [] };
+                }
+            }, [obs.AI_Risk_Analysis]);
+
+            return (
+                <div className="fixed inset-0 bg-gray-900/50 flex items-center justify-center p-4 z-50 animate-fade-in">
+                    <div className="bg-white w-full max-w-2xl rounded-lg shadow-xl max-h-[90vh] overflow-y-auto flex flex-col">
+                        <div className="p-4 border-b flex justify-between items-center sticky top-0 bg-white z-10">
+                            <h2 className="text-xl font-bold">Review {obs.Observation_ID}</h2>
+                            <button onClick={onClose} className="text-2xl text-gray-500 hover:text-gray-700">&times;</button>
+                        </div>
+                        <div className="p-6 space-y-4 flex-1">
+                            {/* Observation Details */}
+                            <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 p-3 rounded border border-gray-200">
+                                <div><strong>Project:</strong> {obs.Project_Name}</div>
+                                <div><strong>Date:</strong> {obs.Observation_Date}</div>
+                                <div><strong>Submitted By:</strong> {obs.Submitted_By}</div>
+                                <div><strong>Obs. Type:</strong> {obs.Observation_Type}</div>
+                                <div className="col-span-2"><strong>Desc:</strong> {obs.Description}</div>
+                                {displayImageUrl && (
+                                    <div className="col-span-2">
+                                        <strong className="block mb-2">Attached Image:</strong>
+                                        <img 
+                                            src={displayImageUrl} 
+                                            alt="Evidence" 
+                                            className="w-full max-h-64 object-contain border bg-white rounded"
+                                            onError={(e) => { e.target.onerror = null; e.target.src = 'https://placehold.co/400x300?text=Image+Load+Error'; }} 
+                                        />
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Risk Analysis Section */}
+                            {riskData && (
+                                <div className="bg-yellow-50 border border-yellow-200 rounded p-3 text-sm">
+                                    <h3 className="font-bold text-yellow-800 border-b border-yellow-200 pb-1 mb-2">Risk Analysis</h3>
+                                    <div className="mb-1"><strong>Severity:</strong> <span className={riskData.severity === 'High' ? 'text-red-600 font-bold' : ''}>{riskData.severity}</span></div>
+                                    <div><strong>Mitigation:</strong>
+                                        <ul className="list-disc ml-5 mt-1 text-gray-700">
+                                            {riskData.mitigationSteps && riskData.mitigationSteps.map((step, idx) => (
+                                                <li key={idx}>{step}</li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Action Fields */}
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="font-bold text-sm block mb-1">PM Type</label>
+                                    <select value={pmType} onChange={e => setPmType(e.target.value)} className="w-full border p-2 rounded">
+                                        <option value="">Select Type...</option>
+                                        {Object.values(PmTypes).map(t => <option key={t} value={t}>{t}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="font-bold text-sm block mb-1">Status</label>
+                                    <select value={status} onChange={e => setStatus(e.target.value)} className="w-full border p-2 rounded">
+                                        {Object.values(PmStatus).map(s => <option key={s} value={s}>{s}</option>)}
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <label className="font-bold text-sm block mb-1">Comments</label>
+                                <textarea value={comment} onChange={e => setComment(e.target.value)} className="w-full border p-2 rounded" rows="3" placeholder="Add PM comments..."></textarea>
+                            </div>
+                        </div>
+                        <div className="p-4 border-t flex justify-end gap-2 sticky bottom-0 bg-white">
+                            <button onClick={onClose} className="px-4 py-2 border rounded hover:bg-gray-50 text-gray-700">Cancel</button>
+                            <button onClick={handleSave} className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 shadow">Save Changes</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- 5. DASHBOARD COMPONENT ---
+        const PmDashboard = () => {
+            const [data, setData] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [filters, setFilters] = useState({ project: '', status: '', submittedBy: '', type: '' });
+            const [selectedObs, setSelectedObs] = useState(null);
+            
+            const loadData = () => {
+                setLoading(true);
+                getHistoricalData().then(d => {
+                    const unique = []; 
+                    const map = new Map();
+                    d.forEach(i => { if(!map.has(i.Observation_ID)){ map.set(i.Observation_ID, true); unique.push(i); }});
+                    unique.sort((a,b) => new Date(b.Observation_Date) - new Date(a.Observation_Date));
+                    setData(unique);
+                    setLoading(false);
+                });
+            };
+
+            useEffect(() => { loadData(); }, []);
+
+            const handleUpdate = (payload) => {
+                setLoading(true);
+                updateObservation(payload).then(() => {
+                    loadData();
+                    setSelectedObs(null);
+                }).catch(e => { alert(e); setLoading(false); });
+            };
+
+            const filteredData = data.filter(item => {
+                return (!filters.project || item.Project_Name === filters.project) &&
+                       (!filters.status || item.Status === filters.status) &&
+                       (!filters.submittedBy || item.Submitted_By === filters.submittedBy) &&
+                       (!filters.type || item.PM_Action_Type === filters.type);
+            });
+
+            const projectOptions = [...new Set(data.map(i => i.Project_Name))].filter(Boolean);
+
+            const getStatusClass = (s) => {
+                if(s === 'In Progress') return 'bg-blue-100 text-blue-800';
+                if(s === 'Closed') return 'bg-green-100 text-green-800';
+                if(s === 'Rejected') return 'bg-red-100 text-red-800';
+                if(s === 'Accepted') return 'bg-purple-100 text-purple-800';
+                return 'bg-gray-100 text-gray-800';
+            };
+
+            if(loading) return <div className="p-10 text-center flex flex-col items-center"><div className="loader mb-2"></div>Loading Dashboard...</div>;
+
+            return (
+                <div className="p-6 max-w-7xl mx-auto">
+                    <div className="bg-white p-4 rounded shadow mb-6">
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+                            <select onChange={e => setFilters(p => ({ ...p, project: e.target.value }))} className="bg-white rounded border p-2 text-gray-700">
+                                <option value="">All Projects</option>
+                                {projectOptions.map(p => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                            <select onChange={e => setFilters(p => ({ ...p, status: e.target.value }))} className="bg-white rounded border p-2 text-gray-700">
+                                <option value="">All Statuses</option>
+                                {Object.values(PmStatus).map(s => <option key={s} value={s}>{s}</option>)}
+                            </select>
+                            <select onChange={e => setFilters(p => ({ ...p, type: e.target.value }))} className="bg-white rounded border p-2 text-gray-700">
+                                <option value="">All PM Types</option>
+                                {Object.values(PmTypes).map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                            <select onChange={e => setFilters(p => ({ ...p, submittedBy: e.target.value }))} className="bg-white rounded border p-2 text-gray-700">
+                                <option value="">All Submitters</option>
+                                {ALL_ATTENDEES.map(p => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                            <button onClick={loadData} className="bg-gray-200 text-gray-800 py-2 rounded hover:bg-gray-300 transition">Refresh</button>
+                        </div>
+                    </div>
+
+                    <div className="bg-white rounded shadow overflow-hidden overflow-x-auto">
+                        <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">ID</th>
+                                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Date</th>
+                                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Submitted By</th>
+                                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Project</th>
+                                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">PM Type</th>
+                                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Status</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Comments</th>
+                                    <th className="px-4 py-3 text-right text-xs font-bold text-gray-500 uppercase">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="bg-white divide-y divide-gray-200">
+                                {filteredData.map(row => (
+                                    <tr key={row.Observation_ID} className="hover:bg-gray-50 transition">
+                                        <td className="px-4 py-3 text-sm font-medium text-gray-900">{row.Observation_ID}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.Observation_Date}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.Submitted_By}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500 truncate max-w-xs">{row.Project_Name}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.PM_Action_Type || '-'}</td>
+                                        <td className="px-4 py-3">
+                                            <span className={`px-2 py-1 text-xs rounded-full font-semibold ${getStatusClass(row.Status)}`}>{row.Status || 'New'}</span>
+                                        </td>
+                                        <td className="px-4 py-3 text-sm text-gray-500 truncate max-w-xs">{row.PM_Comments || '-'}</td>
+                                        <td className="px-4 py-3 text-right whitespace-nowrap text-sm font-medium">
+                                            <button onClick={() => setSelectedObs(row)} className="text-indigo-600 hover:text-indigo-900 font-bold">Review</button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    {selectedObs && <ReviewModal obs={selectedObs} onClose={() => setSelectedObs(null)} onSave={handleUpdate} />}
+                </div>
+            );
+        };
+
+        // --- 6. INTAKE FORM COMPONENT ---
+        const IntakeForm = () => {
+            const [meta, setMeta] = useState({ reportNo: '...', seq: 0 });
+            const [queue, setQueue] = useState([]);
+            const [isReportInfoLocked, setIsReportInfoLocked] = useState(false);
+            const [loading, setLoading] = useState(true);
+            const [aiLoading, setAiLoading] = useState(false);
+            const [obsCount, setObsCount] = useState(1);
+            const fileRef = useRef(null);
+            const [errors, setErrors] = useState({});
+
+            const [formState, setFormState] = useState({
+                observationId: '', reportNumber: '', submittedBy: '', observationDate: new Date().toISOString().split('T')[0],
+                startTime: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+                projectType: '', projectName: '', percentComplete: '', stage: '', location: '', buildingLevel: '',
+                weather: '', degrees: '', presentAtSite: [], observationType: '', changeReason: '', priority: '',
+                description: '', images: [], aiRiskAnalysis: null
+            });
+
+            useEffect(() => {
+                getInitialData().then(d => {
+                    const y = new Date().getFullYear();
+                    const seqStr = String(d.nextReportNumber).padStart(3, '0');
+                    setMeta({ seq: d.nextReportNumber, reportNo: `FOR-${y}-${seqStr}` });
+                    setLoading(false);
+                }).catch(e => { console.error(e); setLoading(false); });
+            }, []);
+
+            const visibleAttendeeGroups = useMemo(() => {
+                if (formState.projectType === 'TDP') return Object.entries(ATTENDEES_GROUPS).filter(([group]) => group === 'ITSD');
+                return Object.entries(ATTENDEES_GROUPS);
+            }, [formState.projectType]);
+
+            const handleInputChange = (e) => {
+                const { name, value } = e.target;
+                setFormState(prev => {
+                    const updates = { [name]: value };
+                    if (name === 'projectType') {
+                        updates.projectName = ''; updates.location = ''; updates.buildingLevel = ''; updates.presentAtSite = [];
+                    }
+                    return { ...prev, ...updates };
+                });
+                if (errors[name]) setErrors(prev => ({ ...prev, [name]: null }));
+            };
+
+            const handleAttendeeToggle = (attendee) => {
+                if (isReportInfoLocked) return;
+                setFormState(prev => {
+                    const current = prev.presentAtSite;
+                    return { ...prev, presentAtSite: current.includes(attendee) ? current.filter(a => a !== attendee) : [...current, attendee] };
+                });
+            };
+
+            const handleImageChange = (e) => {
+                if (e.target.files) {
+                    Array.from(e.target.files).forEach((f) => {
+                        const r = new FileReader();
+                        r.onload = () => setFormState(prev => ({ ...prev, images: [...prev.images, { name: f.name, type: f.type, dataUrl: r.result }] }));
+                        r.readAsDataURL(f);
+                    });
+                    if (fileRef.current) fileRef.current.value = '';
+                }
+            };
+
+            const handleAiAnalysis = () => {
+                if (!formState.description) return alert("Please enter a description first.");
+                setAiLoading(true);
+                analyzeRiskWithGemini(formState.description)
+                    .then(result => setFormState(prev => ({ ...prev, aiRiskAnalysis: result })))
+                    .catch(err => console.error(err))
+                    .finally(() => setAiLoading(false));
+            };
+
+            const validateForm = () => {
+                const newErrors = {};
+                if (!formState.submittedBy) newErrors.submittedBy = "Required";
+                if (!formState.observationDate) newErrors.observationDate = "Required";
+                if (!formState.projectType) newErrors.projectType = "Required";
+                if (!formState.projectName) newErrors.projectName = "Required";
+                if (!formState.observationType) newErrors.observationType = "Required";
+                if (!formState.description) newErrors.description = "Required";
+                if (formState.observationType === 'Change Requested') {
+                    if (!formState.changeReason) newErrors.changeReason = "Required";
+                    if (!formState.priority) newErrors.priority = "Required";
+                }
+                setErrors(newErrors);
+                return Object.keys(newErrors).length === 0;
+            };
+
+            const addToQueue = () => {
+                if (!validateForm()) { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+                setLoading(true);
+                setTimeout(() => {
+                    const obsNumStr = String(obsCount).padStart(2, '0');
+                    const observationId = `${meta.reportNo}-${obsNumStr}`;
+                    setQueue(prev => [...prev, { ...formState, observationId, reportNumber: meta.reportNo }]);
+                    setIsReportInfoLocked(true);
+                    setObsCount(prev => prev + 1);
+                    setFormState(prev => ({ ...prev, observationType: '', changeReason: '', priority: '', description: '', images: [], aiRiskAnalysis: null }));
+                    setLoading(false);
+                }, 500);
+            };
+
+            const submitFinalReport = () => {
+                if (!confirm("Are you sure you want to submit this report?")) return;
+                setLoading(true);
+                const payload = [];
+                queue.forEach(obs => {
+                    const baseData = {
+                        Observation_ID: obs.observationId, FOR_Report_No: obs.reportNumber, Submitted_By: obs.submittedBy,
+                        Observation_Date: obs.observationDate, Start_Time: obs.startTime, Project_Type: obs.projectType,
+                        Project_Name: obs.projectName, Percent_Complete: obs.percentComplete, Stage: obs.stage,
+                        Location: obs.location, Building_Level: obs.buildingLevel, Weather: obs.weather, Degrees_F: obs.degrees,
+                        Present_at_Site: (obs.presentAtSite).join(', '), Observation_Type: obs.observationType,
+                        Change_Reason: obs.changeReason, Priority: obs.priority, Description: obs.description, Status: "New",
+                        Change_Status: JSON.stringify({ coordination: 'Open', rfi: 'Open', drawings: 'Open', review: 'Open' }),
+                        AI_Risk_Analysis: obs.aiRiskAnalysis ? JSON.stringify(obs.aiRiskAnalysis) : ""
+                    };
+                    if (obs.images.length > 0) {
+                        obs.images.forEach(img => { payload.push({ ...baseData, Image_Name: img.name, Image_DataUrl: img.dataUrl, Image_Type: img.type }); });
+                    } else { payload.push(baseData); }
+                });
+
+                saveObservationsBatch(payload).then(() => { alert("Report Submitted Successfully!"); window.location.reload(); })
+                    .catch(err => { console.error(err); alert("Error submitting report."); setLoading(false); });
+            };
+
+            const getInputClass = (fieldName) => {
+                let baseClass = "mt-1 block w-full rounded-md shadow-sm p-2 border ";
+                if (errors[fieldName]) baseClass += "border-red-500 ring-1 ring-red-500 ";
+                else baseClass += "border-gray-300 focus:border-indigo-500 focus:ring-indigo-500 ";
+                const isUnlockedField = fieldName === 'description' || fieldName === 'observationType';
+                if (isReportInfoLocked && !isUnlockedField) baseClass += "bg-gray-100 cursor-not-allowed";
+                else baseClass += "bg-white";
+                return baseClass;
+            };
+
+            if (loading) return <div className="fixed inset-0 bg-white/90 z-50 flex flex-col items-center justify-center"><div className="loader mb-4"></div><p className="text-lg font-medium text-gray-700">Processing...</p></div>;
+
+            return (
+                <div className="max-w-4xl mx-auto p-4 sm:p-6 pb-20">
+                    <header className="mb-8 border-b pb-4">
+                        <h1 className="text-3xl font-bold text-gray-900">Field Observation Intake</h1>
+                        <p className="text-gray-500">Report #{meta.reportNo}</p>
+                    </header>
+
+                    <section className="bg-white p-6 rounded-lg shadow-md border-t-4 border-indigo-600 mb-6">
+                        <h2 className="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">1. Report Information</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Submitted By <span className="text-red-500">*</span></label>
+                                <select name="submittedBy" value={formState.submittedBy} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('submittedBy')}>
+                                    <option value="">Select Name</option>
+                                    {ALL_ATTENDEES.map(name => <option key={name} value={name}>{name}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Observation Date <span className="text-red-500">*</span></label>
+                                <input type="date" name="observationDate" value={formState.observationDate} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('observationDate')} />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Project Type <span className="text-red-500">*</span></label>
+                                <select name="projectType" value={formState.projectType} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('projectType')}>
+                                    <option value="">Select Type</option>
+                                    {Object.keys(PROJECTS).map(k => <option key={k} value={k}>{k}</option>)}
+                                </select>
+                            </div>
+                            <div className="lg:col-span-2">
+                                <label className="block text-sm font-medium text-gray-700">Project Name <span className="text-red-500">*</span></label>
+                                <select name="projectName" value={formState.projectName} onChange={handleInputChange} disabled={isReportInfoLocked || !formState.projectType} className={getInputClass('projectName')}>
+                                    <option value="">Select Project</option>
+                                    {formState.projectType && PROJECTS[formState.projectType].map(p => <option key={p} value={p}>{p}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Stage</label>
+                                <select name="stage" value={formState.stage} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('stage')}>
+                                    <option value="">Select Stage</option>
+                                    {STAGES.map(s => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                            </div>
+                            {formState.projectType === 'TDP' && (
+                                <>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">Location</label>
+                                        <select name="location" value={formState.location} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('location')}>
+                                            <option value="">Select Location</option>
+                                            {LOCATIONS.map(l => <option key={l} value={l}>{l}</option>)}
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">Building Level</label>
+                                        <select name="buildingLevel" value={formState.buildingLevel} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('buildingLevel')}>
+                                            <option value="">Select Level</option>
+                                            {BUILDING_LEVELS.map(l => <option key={l} value={l}>{l}</option>)}
+                                        </select>
+                                    </div>
+                                </>
+                            )}
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Weather</label>
+                                <select name="weather" value={formState.weather} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('weather')}>
+                                    <option value="">Select</option>
+                                    {WEATHER.map(w => <option key={w} value={w}>{w}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">% Complete</label>
+                                <input type="number" name="percentComplete" value={formState.percentComplete} onChange={handleInputChange} disabled={isReportInfoLocked} className={getInputClass('percentComplete')} />
+                            </div>
+                            <div className="md:col-span-2 lg:col-span-3">
+                                <label className="block text-sm font-medium text-gray-700 mb-2">Present at Site</label>
+                                <div className={`border rounded-md p-4 h-60 overflow-y-auto ${isReportInfoLocked ? 'bg-gray-100 opacity-75' : 'bg-white'}`}>
+                                    {visibleAttendeeGroups.map(([group, attendees]) => (
+                                        <div key={group} className="mb-4">
+                                            <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 border-b">{group}</h4>
+                                            <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                                                {attendees.map(attendee => (
+                                                    <label key={attendee} className="flex items-center space-x-2 text-sm cursor-pointer hover:bg-gray-50 p-1 rounded">
+                                                        <input type="checkbox"
+                                                            checked={(formState.presentAtSite).includes(attendee)}
+                                                            onChange={() => handleAttendeeToggle(attendee)}
+                                                            disabled={isReportInfoLocked}
+                                                            className="rounded text-indigo-600 focus:ring-indigo-500"
+                                                        />
+                                                        <span>{attendee}</span>
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section className="bg-white p-6 rounded-lg shadow-md border-t-4 border-teal-600 mb-6 relative">
+                        {aiLoading && (
+                            <div className="absolute inset-0 bg-white/75 flex flex-col items-center justify-center z-10 rounded-lg">
+                                <div className="loader mb-2"></div>
+                                <span className="text-teal-700 font-semibold">Gemini AI is analyzing...</span>
+                            </div>
+                        )}
+
+                        <div className="flex justify-between items-center mb-4 border-b pb-2">
+                            <h2 className="text-xl font-semibold text-gray-800">2. Observation Details</h2>
+                            <span className="bg-gray-100 text-gray-600 px-2 py-1 rounded text-xs font-mono">
+                                ID: {meta.reportNo}-{String(obsCount).padStart(2, '0')}
+                            </span>
+                        </div>
+
+                        <div className="space-y-6">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">Observation Type <span className="text-red-500">*</span></label>
+                                <div className="flex flex-wrap gap-4">
+                                    {["General", "Change Requested", "Risk", "Safety"].map(type => (
+                                        <label key={type} className="flex items-center space-x-2 cursor-pointer border p-2 rounded hover:bg-gray-50">
+                                            <input type="radio" name="observationType" value={type}
+                                                checked={formState.observationType === type}
+                                                onChange={handleInputChange}
+                                                className="text-teal-600 focus:ring-teal-500"
+                                            />
+                                            <span>{type}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                                {errors.observationType && <p className="text-red-500 text-xs mt-1">{errors.observationType}</p>}
+                            </div>
+
+                            {formState.observationType === 'Change Requested' && (
+                                <div className="bg-blue-50 p-4 rounded-md border border-blue-200 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">Reason for Change <span className="text-red-500">*</span></label>
+                                        <select name="changeReason" value={formState.changeReason} onChange={handleInputChange} className={getInputClass('changeReason')}>
+                                            <option value="">Select Reason</option>
+                                            <option>Design Error</option>
+                                            <option>Field Condition</option>
+                                            <option>Owner Request</option>
+                                            <option>Code Requirement</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700">Priority <span className="text-red-500">*</span></label>
+                                        <select name="priority" value={formState.priority} onChange={handleInputChange} className={getInputClass('priority')}>
+                                            <option value="">Select Priority</option>
+                                            <option>Low</option>
+                                            <option>Medium</option>
+                                            <option>High</option>
+                                            <option>Critical</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700">Description <span className="text-red-500">*</span></label>
+                                <textarea name="description" rows={4} value={formState.description} onChange={handleInputChange} className={getInputClass('description')} placeholder="Describe the observation in detail..."></textarea>
+                                {errors.description && <p className="text-red-500 text-xs mt-1">{errors.description}</p>}
+                            </div>
+
+                            {formState.observationType === 'Risk' && (
+                                <div className="bg-yellow-50 border border-yellow-200 rounded-md p-4">
+                                    <h3 className="text-sm font-bold text-yellow-800 mb-2">AI Risk Analysis</h3>
+                                    {formState.aiRiskAnalysis ? (
+                                        <div className="text-sm text-gray-700 space-y-1">
+                                            <p><strong>Severity:</strong> <span className={formState.aiRiskAnalysis.severity === 'High' ? 'text-red-600 font-bold' : 'text-gray-800'}>{formState.aiRiskAnalysis.severity}</span></p>
+                                            <div><strong>Mitigation:</strong>
+                                                <ul className="list-disc ml-5">{formState.aiRiskAnalysis.mitigationSteps?.map((s, i) => <li key={i}>{s}</li>)}</ul>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <button onClick={handleAiAnalysis} className="bg-yellow-500 hover:bg-yellow-600 text-white text-sm px-3 py-1.5 rounded transition shadow-sm">
+                                            Analyze with Gemini AI
+                                        </button>
+                                    )}
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">Images</label>
+                                <div className="flex items-center space-x-4">
+                                    <label className="cursor-pointer bg-white border border-gray-300 rounded-md px-4 py-2 hover:bg-gray-50 shadow-sm text-sm font-medium text-gray-700 transition">
+                                        <span>Choose Files</span>
+                                        <input type="file" multiple accept="image/*" onChange={handleImageChange} ref={fileRef} className="hidden" />
+                                    </label>
+                                    <span className="text-xs text-gray-500">{formState.images.length} file(s) selected</span>
+                                </div>
+
+                                {formState.images.length > 0 && (
+                                    <div className="flex flex-wrap gap-2 mt-3">
+                                        {formState.images.map((img, idx) => (
+                                            <div key={idx} className="relative group w-20 h-20 border rounded overflow-hidden">
+                                                <img src={img.dataUrl} alt="preview" className="w-full h-full object-cover" />
+                                                <button onClick={() => removeImage(idx)} className="absolute top-0 right-0 bg-red-600 text-white w-5 h-5 flex items-center justify-center opacity-0 group-hover:opacity-100 transition text-xs">×</button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="flex justify-end mt-6 space-x-3">
+                            <button onClick={() => {
+                                if (confirm("Reset form?")) setFormState(prev => ({ ...prev, observationType: '', description: '', images: [], aiRiskAnalysis: null }));
+                            }} className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                                Clear
+                            </button>
+                            <button onClick={addToQueue} className="px-6 py-2 bg-teal-600 text-white rounded-md hover:bg-teal-700 shadow-sm font-medium flex items-center transition">
+                                <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                                Add to Queue
+                            </button>
+                        </div>
+                    </section>
+
+                    {queue.length > 0 && (
+                        <section className="bg-white p-6 rounded-lg shadow-md border-t-4 border-green-600">
+                            <div className="flex justify-between items-center mb-4">
+                                <h2 className="text-xl font-semibold text-gray-800">3. Queue for Submission</h2>
+                                <span className="bg-green-100 text-green-800 text-sm font-bold px-3 py-1 rounded-full">
+                                    {queue.length} Ready
+                                </span>
+                            </div>
+
+                            <div className="overflow-x-auto mb-6">
+                                <table className="min-w-full divide-y divide-gray-200">
+                                    <thead className="bg-gray-50">
+                                        <tr>
+                                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                                            <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Description</th>
+                                            <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Images</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="bg-white divide-y divide-gray-200">
+                                        {queue.map((obs) => (
+                                            <tr key={obs.observationId}>
+                                                <td className="px-4 py-3 text-sm font-medium text-gray-900">{obs.observationId}</td>
+                                                <td className="px-4 py-3 text-sm text-gray-500">{obs.observationType}</td>
+                                                <td className="px-4 py-3 text-sm text-gray-500 truncate max-w-xs">{obs.description}</td>
+                                                <td className="px-4 py-3 text-sm text-gray-500 text-center">{obs.images.length}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <button onClick={submitFinalReport} className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg shadow-lg flex justify-center items-center transition-all">
+                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                Finalize & Submit Report
+                            </button>
+                        </section>
+                    )}
+                </div>
+            );
+        };
+
+        // --- 6. MAIN APP COMPONENT ---
+        const App = () => {
+            const [view, setView] = useState('form');
+
+            useEffect(() => {
+                // Keep ability to auto-switch if link is used, but allow manual toggle
+                google.script.url.getLocation(location => {
+                    if (location.parameter.view === "pm-dashboard-secret-key-156271") setView('dashboard');
+                });
+            }, []);
+
+            return (
+                <div className="min-h-screen bg-gray-50">
+                     <nav className="bg-white shadow-sm border-b px-6 py-3 flex justify-between items-center sticky top-0 z-50">
+                        <div className="font-bold text-xl text-indigo-700 tracking-tight flex items-center">
+                            <svg className="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            ITSD Field Observation Report
+                        </div>
+                        <div className="bg-gray-100 p-1 rounded-lg flex text-sm font-medium">
+                            <button 
+                                onClick={() => setView('form')} 
+                                className={`px-4 py-1.5 rounded-md transition-all duration-200 ${view==='form' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                            >
+                                New Report
+                            </button>
+                            <button 
+                                onClick={() => setView('dashboard')} 
+                                className={`px-4 py-1.5 rounded-md transition-all duration-200 ${view==='dashboard' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                            >
+                                PM Dashboard
+                            </button>
+                        </div>
+                     </nav>
+
+                    <div className="animate-fade-in">
+                        {view === 'dashboard' ? <PmDashboard /> : <IntakeForm />}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
