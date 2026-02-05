@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Field Observation System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #888; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #3b82f6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .animate-fade-in { animation: fadeIn 0.2s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="react,typescript">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // --- 1. SERVICE LAYER ---
+        const GAS = {
+            run: (fname, ...args) => new Promise((resolve, reject) => {
+                if (typeof google !== 'undefined' && google.script && google.script.run) {
+                    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fname](...args);
+                } else {
+                    // PREVIEW MOCK
+                    setTimeout(() => {
+                        if (fname === 'getInitialData') resolve({ 
+                            nextReportNumber: 101, 
+                            config: {
+                                programs: ['TDP', 'CIP'],
+                                projects: { 'TDP': ['Project A'], 'CIP': ['Project B'] },
+                                companies: ['Alterman', 'ITSD'],
+                                people: [{name:'Pablo', company:'Alterman'}, {name:'Kendall', company:'ITSD'}]
+                            }
+                        });
+                        else resolve({ success: true });
+                    }, 500);
+                }
+            })
+        };
+
+        const getInitialData = () => GAS.run('getInitialData');
+        const saveObservationsBatch = (payload) => GAS.run('saveObservationsBatch', payload);
+        const analyzeRiskWithGemini = (desc) => GAS.run('analyzeRiskWithGemini', desc);
+        const getHistoricalData = () => GAS.run('getHistoricalData');
+        const updateObservation = (payload) => GAS.run('updateObservation', payload);
+        const addAdminEntry = (type, v1, v2) => GAS.run('addAdminEntry', type, v1, v2);
+
+        // --- 2. CONSTANTS (PRESERVED) ---
+        const STAGES = ["Construction", "Commissioning", "Trials", "Handover"];
+        const LOCATIONS = ['Ticket Hall East', 'Ticket Hall West', 'Ticket Hall Interior', 'Ticket Hall South', 'Sterile Corridor', 'Baggage', 'Great Hall', 'Connector', 'CUP', 'Apron', 'Access Roadway', 'Elevator', 'Hold room'];
+        const BUILDING_LEVELS = ['Level 1', 'Level 2', 'Level 3', 'Roof'];
+        const WEATHER = ["Dry", "Wet"];
+        const PmStatus = { IN_PROGRESS: 'In Progress', ACCEPTED: 'Accepted', REJECTED: 'Rejected', CLOSED: 'Closed' };
+        const PmTypes = { RFI: 'RFI', COORD: 'Contractor Coordination', SUBMITTAL: 'Submittal', CHANGE_REQ: 'Change Request', GEN_OBS: 'General Observation', CLOSED: 'Closed' };
+
+        // --- 3. COMPONENTS ---
+
+        // ADMIN PANEL
+        const AdminPanel = ({ config, onConfigUpdate }) => {
+            const [type, setType] = useState('Project'); 
+            const [val1, setVal1] = useState('');
+            const [val2, setVal2] = useState('');
+            const [saving, setSaving] = useState(false);
+
+            const handleSave = () => {
+                if(!val1) return alert("Required field missing");
+                setSaving(true);
+                addAdminEntry(type, val1, val2).then((data) => {
+                    alert("Entry Added!");
+                    setVal1(''); setVal2('');
+                    if(onConfigUpdate && data.config) onConfigUpdate(data.config);
+                    setSaving(false);
+                });
+            };
+
+            return (
+                <div className="p-6 max-w-2xl mx-auto bg-white rounded shadow-md mt-6">
+                    <h2 className="text-xl font-bold mb-4 border-b pb-2">Admin Configuration</h2>
+                    <div className="flex space-x-4 mb-4">
+                        <button onClick={()=>setType('Project')} className={`px-4 py-2 rounded ${type==='Project'?'bg-indigo-600 text-white':'bg-gray-200'}`}>Add Project</button>
+                        <button onClick={()=>setType('Person')} className={`px-4 py-2 rounded ${type==='Person'?'bg-indigo-600 text-white':'bg-gray-200'}`}>Add Person</button>
+                    </div>
+                    <div className="space-y-4">
+                        {type === 'Project' && (
+                            <>
+                                <label className="block text-sm font-bold">Program Name (e.g., TDP)</label>
+                                <input list="programs" value={val1} onChange={e=>setVal1(e.target.value)} className="w-full border p-2 rounded" />
+                                <datalist id="programs">{config.programs.map(p=><option key={p} value={p} />)}</datalist>
+                                
+                                <label className="block text-sm font-bold">New Project Name</label>
+                                <input value={val2} onChange={e=>setVal2(e.target.value)} className="w-full border p-2 rounded" />
+                            </>
+                        )}
+                        {type === 'Person' && (
+                            <>
+                                <label className="block text-sm font-bold">Company</label>
+                                <input list="companies" value={val1} onChange={e=>setVal1(e.target.value)} className="w-full border p-2 rounded" />
+                                <datalist id="companies">{config.companies.map(c=><option key={c} value={c} />)}</datalist>
+
+                                <label className="block text-sm font-bold">Person Name</label>
+                                <input value={val2} onChange={e=>setVal2(e.target.value)} className="w-full border p-2 rounded" />
+                            </>
+                        )}
+                        <button onClick={handleSave} disabled={saving} className="w-full bg-green-600 text-white py-2 rounded font-bold">{saving ? 'Saving...' : 'Add Entry'}</button>
+                    </div>
+                </div>
+            );
+        };
+
+        // REVIEW MODAL (ENHANCED WITH RISK CLOSEOUT)
+        const ReviewModal = ({ obs, onClose, onSave }) => {
+            const [status, setStatus] = useState(obs.Status || 'In Progress');
+            const [pmType, setPmType] = useState(obs.PM_Action_Type || '');
+            const [comment, setComment] = useState(obs.PM_Comments || '');
+            // Risk Fields
+            const [riskNotes, setRiskNotes] = useState(obs.Risk_Closeout_Notes || '');
+            const [riskDate, setRiskDate] = useState(obs.Risk_Closeout_Date ? obs.Risk_Closeout_Date.split('T')[0] : '');
+
+            // Determine if Risk Closeout is needed
+            const isRisk = obs.Observation_Type === 'Risk' || (obs.AI_Risk_Analysis && obs.AI_Risk_Analysis.length > 5);
+
+            const handleSave = () => {
+                onSave({
+                    Observation_ID: obs.Observation_ID,
+                    Status: status,
+                    PM_Action_Type: pmType,
+                    PM_Comments: comment,
+                    Risk_Closeout_Notes: riskNotes,
+                    Risk_Closeout_Date: riskDate
+                });
+            };
+
+            return (
+                <div className="fixed inset-0 bg-gray-900/50 flex items-center justify-center p-4 z-50 animate-fade-in">
+                    <div className="bg-white w-full max-w-2xl rounded-lg shadow-xl max-h-[90vh] overflow-y-auto p-6">
+                        <div className="flex justify-between items-center border-b pb-4 mb-4">
+                            <h2 className="text-xl font-bold">Review {obs.Observation_ID}</h2>
+                            <button onClick={onClose} className="text-2xl">&times;</button>
+                        </div>
+                        
+                        <div className="grid grid-cols-2 gap-4 text-sm bg-gray-50 p-3 rounded mb-4">
+                            <div><strong>Program:</strong> {obs.Program_Name || obs.Project_Type}</div>
+                            <div><strong>Project:</strong> {obs.Project_Name}</div>
+                            <div><strong>Location:</strong> {obs.Location}</div>
+                            <div><strong>Stage:</strong> {obs.Stage}</div>
+                            <div className="col-span-2"><strong>Desc:</strong> {obs.Description}</div>
+                            {obs.AI_Risk_Analysis && <div className="col-span-2 text-xs text-yellow-800 bg-yellow-100 p-2 rounded"><strong>AI Analysis:</strong> {obs.AI_Risk_Analysis}</div>}
+                        </div>
+
+                        {/* Standard PM Fields */}
+                        <div className="grid grid-cols-2 gap-4 mb-4">
+                            <div>
+                                <label className="font-bold text-sm block mb-1">Status</label>
+                                <select value={status} onChange={e=>setStatus(e.target.value)} className="w-full border p-2 rounded">
+                                    {Object.values(PmStatus).map(s=><option key={s} value={s}>{s}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="font-bold text-sm block mb-1">PM Type</label>
+                                <select value={pmType} onChange={e=>setPmType(e.target.value)} className="w-full border p-2 rounded">
+                                    {Object.values(PmTypes).map(t=><option key={t} value={t}>{t}</option>)}
+                                </select>
+                            </div>
+                        </div>
+
+                        {/* RISK CLOSEOUT SECTION (REQ #2) */}
+                        {isRisk && (
+                            <div className="bg-red-50 border border-red-200 rounded p-4 mb-4">
+                                <h3 className="font-bold text-red-800 mb-2 border-b border-red-200 pb-1">Risk Closeout & Tracking</h3>
+                                <div className="grid grid-cols-1 gap-3">
+                                    <div>
+                                        <label className="text-xs font-bold uppercase text-gray-600">Closeout Date (For Duration Tracking)</label>
+                                        <input type="date" value={riskDate} onChange={e=>setRiskDate(e.target.value)} className="w-full border p-2 rounded bg-white" />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-bold uppercase text-gray-600">Resolution Notes</label>
+                                        <textarea value={riskNotes} onChange={e=>setRiskNotes(e.target.value)} className="w-full border p-2 rounded bg-white" rows="2" placeholder="Document how the risk was mitigated..."></textarea>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <label className="font-bold text-sm block mb-1">PM General Comments</label>
+                        <textarea value={comment} onChange={e=>setComment(e.target.value)} className="w-full border p-2 rounded mb-4" rows="3"></textarea>
+                        
+                        <div className="flex justify-end gap-2">
+                            <button onClick={onClose} className="px-4 py-2 border rounded">Cancel</button>
+                            <button onClick={handleSave} className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Save Updates</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // PM DASHBOARD
+        const PmDashboard = () => {
+            const [data, setData] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [selectedObs, setSelectedObs] = useState(null);
+
+            const loadData = () => {
+                setLoading(true);
+                getHistoricalData().then(d => {
+                    const unique = []; 
+                    const map = new Map();
+                    // Simple dedup based on ID
+                    d.forEach(i => { if(!map.has(i.Observation_ID)){ map.set(i.Observation_ID, true); unique.push(i); }});
+                    setData(unique);
+                    setLoading(false);
+                });
+            };
+
+            useEffect(() => { loadData(); }, []);
+
+            const handleUpdate = (payload) => {
+                updateObservation(payload).then(() => { loadData(); setSelectedObs(null); });
+            };
+
+            if(loading) return <div className="p-10 text-center"><div className="loader mx-auto"></div></div>;
+
+            return (
+                <div className="p-6 max-w-7xl mx-auto">
+                    <h2 className="text-2xl font-bold mb-4">PM Dashboard</h2>
+                    <div className="bg-white rounded shadow overflow-x-auto">
+                        <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">ID</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Program</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Project</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Stage</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Type</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Status</th>
+                                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">Risk Date</th>
+                                    <th className="px-4 py-3"></th>
+                                </tr>
+                            </thead>
+                            <tbody className="bg-white divide-y divide-gray-200">
+                                {data.map(row => (
+                                    <tr key={row.Observation_ID} className="hover:bg-gray-50">
+                                        <td className="px-4 py-3 text-sm font-medium">{row.Observation_ID}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.Program_Name || row.Project_Type}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500 truncate max-w-xs">{row.Project_Name}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.Stage}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.Observation_Type}</td>
+                                        <td className="px-4 py-3 text-sm">{row.Status}</td>
+                                        <td className="px-4 py-3 text-sm text-gray-500">{row.Risk_Closeout_Date || '-'}</td>
+                                        <td className="px-4 py-3 text-right">
+                                            <button onClick={() => setSelectedObs(row)} className="text-indigo-600 font-bold hover:text-indigo-900">Review</button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    {selectedObs && <ReviewModal obs={selectedObs} onClose={() => setSelectedObs(null)} onSave={handleUpdate} />}
+                </div>
+            );
+        };
+
+        // INTAKE FORM
+        const IntakeForm = ({ config }) => {
+            const [meta, setMeta] = useState({ reportNo: '...', seq: 0 });
+            const [queue, setQueue] = useState([]);
+            const [isReportInfoLocked, setIsReportInfoLocked] = useState(false);
+            const [loading, setLoading] = useState(true);
+            const [aiLoading, setAiLoading] = useState(false);
+            const [obsCount, setObsCount] = useState(1);
+            
+            // Initial Config
+            useEffect(() => {
+                getInitialData().then(data => {
+                    const year = new Date().getFullYear();
+                    const num = String(data.nextReportNumber).padStart(3, '0');
+                    setMeta({ reportNo: `FOR-${year}-${num}`, seq: 0 });
+                });
+            }, []);
+
+            const [formState, setFormState] = useState({
+                submittedBy: '', 
+                observationDate: new Date().toISOString().split('T')[0],
+                startTime: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+                projectType: '', // Frontend variable for Program Name
+                projectName: '', percentComplete: '', stage: '', location: '', buildingLevel: '',
+                weather: '', presentAtSite: [], observationType: '', changeReason: '', priority: '',
+                description: '', images: [], aiRiskAnalysis: null
+            });
+
+            // Dynamic Projects based on Program
+            const availableProjects = useMemo(() => {
+                if (!formState.projectType || !config.projects) return [];
+                return config.projects[formState.projectType] || config.projects['General'] || [];
+            }, [formState.projectType, config]);
+
+            // Dynamic Attendees by Company
+            const attendeesByCompany = useMemo(() => {
+                const groups = {};
+                if(config.people) {
+                    config.people.forEach(p => {
+                        if(!groups[p.company]) groups[p.company] = [];
+                        groups[p.company].push(p.name);
+                    });
+                }
+                return Object.entries(groups);
+            }, [config]);
+
+            const handleInputChange = (e) => {
+                const { name, value } = e.target;
+                setFormState(prev => {
+                    const updates = { [name]: value };
+                    if (name === 'projectType') {
+                        updates.projectName = ''; // Reset project if program changes
+                    }
+                    return { ...prev, ...updates };
+                });
+            };
+
+            const handleAttendeeToggle = (name) => {
+                if (isReportInfoLocked) return;
+                setFormState(prev => {
+                    const current = prev.presentAtSite;
+                    return { ...prev, presentAtSite: current.includes(name) ? current.filter(x=>x!==name) : [...current, name] };
+                });
+            };
+
+            const handleImageChange = (e) => {
+                if (e.target.files) {
+                    Array.from(e.target.files).forEach((f) => {
+                        const r = new FileReader();
+                        r.onload = () => setFormState(prev => ({ ...prev, images: [...prev.images, { name: f.name, type: f.type, dataUrl: r.result }] }));
+                        r.readAsDataURL(f);
+                    });
+                }
+            };
+
+            const handleAiAnalysis = () => {
+                if (!formState.description) return alert("Please enter a description first.");
+                setAiLoading(true);
+                analyzeRiskWithGemini(formState.description)
+                    .then(res => setFormState(prev => ({ ...prev, aiRiskAnalysis: res })))
+                    .finally(() => setAiLoading(false));
+            };
+
+            const addToQueue = () => {
+                if(!formState.projectName) return alert("Project Name Required");
+                
+                const obsId = `${meta.reportNo}-${String(obsCount).padStart(2, '0')}`;
+                setQueue([...queue, { ...formState, observationId: obsId, reportNumber: meta.reportNo }]);
+                setIsReportInfoLocked(true);
+                setObsCount(c => c + 1);
+                
+                // Clear Observation-specific fields
+                setFormState(prev => ({ ...prev, description: '', images: [], observationType: '', aiRiskAnalysis: null }));
+            };
+
+            const submitFinalReport = () => {
+                if(!confirm("Submit Final Report?")) return;
+                setLoading(true);
+                
+                const payload = [];
+                queue.forEach(obs => {
+                    const baseData = {
+                        Observation_ID: obs.observationId, FOR_Report_No: obs.reportNumber, Submitted_By: obs.submittedBy,
+                        Observation_Date: obs.observationDate, Start_Time: obs.startTime, 
+                        Project_Type: obs.projectType, // Maps to Program Name
+                        Project_Name: obs.projectName, Percent_Complete: obs.percentComplete, Stage: obs.stage,
+                        Location: obs.location, Building_Level: obs.buildingLevel, Weather: obs.weather, 
+                        Present_at_Site: (obs.presentAtSite).join(', '), Observation_Type: obs.observationType,
+                        Change_Reason: obs.changeReason, Priority: obs.priority, Description: obs.description, Status: "New",
+                        AI_Risk_Analysis: obs.aiRiskAnalysis ? JSON.stringify(obs.aiRiskAnalysis) : ""
+                    };
+                    
+                    if(obs.images.length > 0) {
+                        obs.images.forEach(img => { 
+                            payload.push({ ...baseData, Image_Name: img.name, Image_DataUrl: img.dataUrl, Image_Type: img.type }); 
+                        });
+                    } else {
+                        payload.push(baseData);
+                    }
+                });
+
+                saveObservationsBatch(payload).then(() => { alert("Saved!"); window.location.reload(); });
+            };
+
+            return (
+                <div className="max-w-4xl mx-auto p-4 pb-20">
+                    {/* 1. REPORT INFO */}
+                    <section className="bg-white p-6 rounded shadow mb-6 border-t-4 border-indigo-600">
+                        <div className="flex justify-between mb-4">
+                            <h2 className="text-xl font-bold">1. Report Information</h2>
+                            <span className="font-mono bg-gray-100 px-2 rounded">Rep #: {meta.reportNo}</span>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <div>
+                                <label className="block text-sm font-bold">Submitted By</label>
+                                <select name="submittedBy" value={formState.submittedBy} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select...</option>
+                                    {config.people.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">Observation Date</label>
+                                <input type="date" name="observationDate" value={formState.observationDate} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded" />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">Program Name</label> 
+                                <select name="projectType" value={formState.projectType} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select Program...</option>
+                                    {config.programs.map(p => <option key={p} value={p}>{p}</option>)}
+                                </select>
+                            </div>
+                            <div className="md:col-span-2">
+                                <label className="block text-sm font-bold">Project Name</label>
+                                <select name="projectName" value={formState.projectName} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select Project...</option>
+                                    {availableProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">Stage</label>
+                                <select name="stage" value={formState.stage} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select...</option>
+                                    {STAGES.map(s => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">Location</label>
+                                <select name="location" value={formState.location} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select...</option>
+                                    {LOCATIONS.map(l => <option key={l} value={l}>{l}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">Building Level</label>
+                                <select name="buildingLevel" value={formState.buildingLevel} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select...</option>
+                                    {BUILDING_LEVELS.map(l => <option key={l} value={l}>{l}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">Weather</label>
+                                <select name="weather" value={formState.weather} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded">
+                                    <option value="">Select...</option>
+                                    {WEATHER.map(w => <option key={w} value={w}>{w}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-bold">% Complete</label>
+                                <input type="number" name="percentComplete" value={formState.percentComplete} onChange={handleInputChange} disabled={isReportInfoLocked} className="w-full border p-2 rounded" />
+                            </div>
+                            
+                            {/* DYNAMIC ATTENDEES */}
+                            <div className="md:col-span-3">
+                                <label className="block text-sm font-bold mb-2">Present at Site</label>
+                                <div className="border rounded p-4 h-48 overflow-y-auto bg-gray-50">
+                                    {attendeesByCompany.map(([company, people]) => (
+                                        <div key={company} className="mb-2">
+                                            <strong className="text-xs text-gray-500 uppercase block mb-1">{company}</strong>
+                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                                {people.map(name => (
+                                                    <label key={name} className="flex items-center space-x-2 text-sm bg-white p-1 rounded border">
+                                                        <input type="checkbox" checked={formState.presentAtSite.includes(name)} onChange={()=>handleAttendeeToggle(name)} disabled={isReportInfoLocked} />
+                                                        <span>{name}</span>
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* 2. OBSERVATION */}
+                    <section className="bg-white p-6 rounded shadow mb-6 border-t-4 border-teal-600 relative">
+                        {aiLoading && <div className="absolute inset-0 bg-white/75 flex items-center justify-center z-10"><div className="loader mr-2"></div> Analyzing Risk...</div>}
+                        
+                        <div className="flex justify-between items-center mb-4 border-b pb-2">
+                            <h2 className="text-xl font-bold">2. Observation Details</h2>
+                            <span className="bg-gray-100 px-2 py-1 rounded text-xs font-mono">ID: {meta.reportNo}-{String(obsCount).padStart(2,'0')}</span>
+                        </div>
+
+                        <div className="space-y-6">
+                            <div>
+                                <label className="block text-sm font-bold mb-2">Observation Type</label>
+                                <div className="flex flex-wrap gap-4">
+                                    {["General", "Change Requested", "Risk", "Safety"].map(type => (
+                                        <label key={type} className="flex items-center space-x-2 border p-2 rounded hover:bg-gray-50 cursor-pointer">
+                                            <input type="radio" name="observationType" value={type} checked={formState.observationType === type} onChange={handleInputChange} />
+                                            <span>{type}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <textarea name="description" rows={4} value={formState.description} onChange={handleInputChange} className="w-full border p-2 rounded" placeholder="Description..."></textarea>
+
+                            {/* AI BUTTON */}
+                            {formState.observationType === 'Risk' && (
+                                <div className="bg-yellow-50 border border-yellow-200 rounded p-4">
+                                    <h3 className="text-sm font-bold text-yellow-800 mb-2">AI Risk Analysis</h3>
+                                    {formState.aiRiskAnalysis ? (
+                                        <div className="text-sm">
+                                            <p><strong>Severity:</strong> {formState.aiRiskAnalysis.severity}</p>
+                                            <ul className="list-disc ml-5">{formState.aiRiskAnalysis.mitigationSteps?.map((s,i)=><li key={i}>{s}</li>)}</ul>
+                                        </div>
+                                    ) : (
+                                        <button onClick={handleAiAnalysis} className="bg-yellow-500 text-white px-3 py-1 rounded text-sm hover:bg-yellow-600">Analyze Risk with Gemini</button>
+                                    )}
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="block text-sm font-bold mb-2">Images</label>
+                                <input type="file" multiple accept="image/*" onChange={handleImageChange} className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100"/>
+                                <div className="flex flex-wrap gap-2 mt-2">
+                                    {formState.images.map((img, i) => (
+                                        <img key={i} src={img.dataUrl} className="w-16 h-16 object-cover border rounded" />
+                                    ))}
+                                </div>
+                            </div>
+                            
+                            <div className="flex justify-end">
+                                <button onClick={addToQueue} className="px-6 py-2 bg-teal-600 text-white rounded font-bold hover:bg-teal-700">Add to Queue</button>
+                            </div>
+                        </div>
+                    </section>
+
+                    {/* 3. QUEUE */}
+                    {queue.length > 0 && (
+                        <section className="bg-white p-6 rounded shadow border-t-4 border-green-600">
+                            <h2 className="text-xl font-bold mb-4">3. Queue ({queue.length})</h2>
+                            <table className="min-w-full divide-y divide-gray-200 mb-4">
+                                <thead><tr><th className="text-left text-xs">ID</th><th className="text-left text-xs">Desc</th></tr></thead>
+                                <tbody>
+                                    {queue.map(q => (
+                                        <tr key={q.observationId}>
+                                            <td className="text-sm font-medium">{q.observationId}</td>
+                                            <td className="text-sm truncate max-w-xs">{q.description}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                            <button onClick={submitFinalReport} className="w-full bg-green-600 text-white py-3 rounded font-bold hover:bg-green-700">Submit Final Report</button>
+                        </section>
+                    )}
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [view, setView] = useState('form');
+            const [config, setConfig] = useState({ programs: [], projects: {}, people: [] });
+
+            useEffect(() => {
+                getInitialData().then(data => {
+                    if(data.config) setConfig(data.config);
+                });
+            }, []);
+
+            return (
+                <div className="min-h-screen bg-gray-50">
+                     <nav className="bg-white shadow px-6 py-3 flex justify-between sticky top-0 z-50">
+                        <div className="font-bold text-xl text-indigo-700">Field Obs System</div>
+                        <div className="flex space-x-2">
+                            <button onClick={()=>setView('form')} className="px-3 py-1 rounded hover:bg-gray-100">Form</button>
+                            <button onClick={()=>setView('dashboard')} className="px-3 py-1 rounded hover:bg-gray-100">PM Dashboard</button>
+                            <button onClick={()=>setView('admin')} className="px-3 py-1 rounded hover:bg-gray-100">Admin</button>
+                        </div>
+                     </nav>
+                    {view === 'form' && <IntakeForm config={config} />}
+                    {view === 'dashboard' && <PmDashboard />}
+                    {view === 'admin' && <AdminPanel config={config} onConfigUpdate={setConfig} />}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
